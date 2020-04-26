@@ -1,0 +1,106 @@
+trigger:
+- master
+
+variables:
+  buildImageName: windows-latest
+  webAppName: colabspacepocapp
+  serviceConnectionName: CoLabSpace-PoC-RG
+  deploySlotName: Staging
+  projectPath: Src/**/WebAPI.csproj
+  testPath: Tests/**/*.csproj
+  buildConfiguration: 'Release'
+  
+stages:
+- stage: Build
+  jobs:
+  - job: Build
+    pool:
+      vmImage: $(buildImageName)
+    steps:
+    # Install .NET Core SDK
+    - task: UseDotNet@2
+      displayName: Install .NET Core SDK
+      name: install_dotnetcore_sdk
+      enabled: true
+      inputs:
+        packageType: 'sdk'
+        version: '3.0.100'
+    # restore
+    - script: dotnet restore
+      displayName: 'dotnet restore'
+    # Build
+    - script: dotnet build --configuration $(buildConfiguration)
+      displayName: 'dotnet build $(buildConfiguration)'
+    # Start Cosmos Emulator
+    - pwsh: |
+        Import-Module "$env:ProgramFiles\Azure Cosmos DB Emulator\PSModules\Microsoft.Azure.CosmosDB.Emulator"
+        Start-CosmosDbEmulator
+      displayName: 'Cosmos DB Emulator'
+      failOnStderr: true
+      errorActionPreference: stop
+    # Start Azure storage emulator
+    - task: CmdLine@2
+      displayName: 'Run Azure Storage Emulator'
+      inputs:
+        script: |
+          "%ProgramFiles(x86)%\Microsoft SDKs\Azure\Storage Emulator\AzureStorageEmulator.exe" init /server "(localdb)\MsSqlLocalDb"
+          "%ProgramFiles(x86)%\Microsoft SDKs\Azure\Storage Emulator\AzureStorageEmulator.exe" start
+    # Run tests and create coverage report
+    - task: DotNetCoreCLI@2
+      displayName: Test
+      env: { 'CosmosDBEndpoint': "https://localhost:8081" }
+      inputs:
+        command: test
+        arguments: '--configuration $(BuildConfiguration) /p:CollectCoverage=true /p:CoverletOutputFormat=cobertura'
+        projects: $(testPath)
+        nobuild: true
+    - task: Palmmedia.reportgenerator.reportgenerator-build-release-task.reportgenerator@4
+      displayName: ReportGenerator
+      inputs:
+        reports: '$(Build.SourcesDirectory)/Tests/**/coverage.cobertura.xml'
+        targetdir: '$(Build.SourcesDirectory)/CodeCoverage'
+        reporttypes: 'HtmlInline_AzurePipelines;Cobertura;Badges'
+        assemblyfilters: '-xunit*'
+    # Publish the code coverage result (summary and web site)
+    # The summary allows to view the coverage percentage in the summary tab
+    # The web site allows to view which lines are covered directly in Azure Pipeline
+    - task: PublishCodeCoverageResults@1
+      displayName: 'Publish code coverage'
+      inputs:
+        codeCoverageTool: Cobertura
+        summaryFileLocation: '$(Build.SourcesDirectory)/CodeCoverage/Cobertura.xml'
+        reportDirectory: '$(Build.SourcesDirectory)/CodeCoverage'
+    # Publish
+    - task: DotNetCoreCLI@2
+      displayName: Publish Project
+      inputs:
+        command: publish
+        publishWebProjects: False
+        projects: $(projectPath)
+        arguments: '--configuration $(buildConfiguration) --output $(System.DefaultWorkingDirectory)/publish'
+        zipAfterPublish: True
+    - publish: publish
+      artifact: webapp
+      displayName: 'Publish artifacts'
+
+- stage: Staging_Deploy
+  dependsOn:
+  - Build
+  condition: succeeded()
+  jobs:
+  - deployment: Development
+    pool:
+      vmImage: $(buildImageName)
+    environment: development
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+          - task: AzureWebApp@1
+            displayName: 'Publish Artifact'
+            inputs:
+              azureSubscription: $(serviceConnectionName)
+              appType: webApp
+              appName: $(webAppName)
+              package: '$(Pipeline.Workspace)/**/*.zip'
+              slotName: $(deploySlotName)
